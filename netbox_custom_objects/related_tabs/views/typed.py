@@ -281,6 +281,13 @@ def _make_typed_tab_view(host_model, cot):
         def get_children(self, request, parent):
             return _typed_queryset(cot, parent, request.user)
 
+        def get_table(self, data, request, bulk_actions=True):
+            # DynamicTableMixin needs the COT to build the table class; the
+            # CO-host view sets it while resolving its slug, this closure
+            # binds it directly.
+            self.custom_object_type = cot
+            return super().get_table(data, request, bulk_actions=bulk_actions)
+
     _TypedTabView.__name__ = f'{host_model.__name__}_{cot.slug}_TypedTabView'
     _TypedTabView.__qualname__ = _TypedTabView.__name__
     return _TypedTabView
