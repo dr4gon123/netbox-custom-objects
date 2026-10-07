@@ -375,6 +375,8 @@ def register_builtin_typed_tab(host_model, cot):
     return _register_tab_view(
         host_model,
         f'custom_objects_{cot.slug}',
-        f'custom-objects/{cot.slug}/',
+        # No trailing slash: register_model_view() appends one (a trailing
+        # slash here produced .../management-accesses// URLs).
+        f'custom-objects/{cot.slug}',
         lambda hm=host_model, c=cot: _make_typed_tab_view(hm, c),
     )
