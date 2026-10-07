@@ -49,7 +49,7 @@ packages = [
     "netbox_custom_objects",
 ]
 package-data = { "netbox_custom_objects" = ["**/*", "templates/**"] }
-exclude-package-data = { netbox_custom_objects = ["tests/*"] }
+#exclude-package-data = { netbox_custom_objects = ["tests/*"] }
 license-files = ["LICENSE.md"]
 
 [tool.ruff]

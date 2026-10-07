@@ -1,0 +1,293 @@
+from urllib.parse import quote
+
+import django_tables2 as tables
+from django.contrib.auth.models import AnonymousUser
+from django.template import Context, Template
+from django.urls import reverse
+from django.utils.safestring import mark_safe
+from django.utils.translation import gettext_lazy as _
+from netbox.tables import NetBoxTable, columns
+from utilities.permissions import get_permission_for_model
+
+from netbox_custom_objects.models import CustomObject, CustomObjectType, CustomObjectTypeField
+from netbox_custom_objects.utilities import get_viewname
+
+__all__ = ("CustomObjectTable", "CustomObjectTypeFieldTable")
+
+
+OBJECTCHANGE_FULL_NAME = """
+{% load helpers %}
+{{ value.get_full_name|placeholder }}
+"""
+
+OBJECTCHANGE_OBJECT = """
+{% if value and value.get_absolute_url %}
+    <a href="{{ value.get_absolute_url }}">{{ record.object_repr }}</a>
+{% else %}
+    {{ record.object_repr }}
+{% endif %}
+"""
+
+BEFORE_DIFF = """
+{% if record.action == 'create' %}
+    {{ ''|placeholder }}
+{% else %}
+    <pre class="p-0">{% for k, v in record.diff.pre.items %}{{ k }}: {{ v }}
+{% endfor %}</pre>
+{% endif %}
+"""
+
+AFTER_DIFF = """
+{% if record.action == 'delete' %}
+    {{ ''|placeholder }}
+{% else %}
+    <pre class="p-0">{% for k, v in record.diff.post.items %}{{ k }}: {{ v }}
+{% endfor %}</pre>
+{% endif %}
+"""
+
+OBJECTCHANGE_REQUEST_ID = """
+<a href="?request_id={{ value }}">{{ value }}</a>
+"""
+
+# The {% url %} tag must stay on a single line: Django's template lexer does not parse a {% %}
+# tag whose delimiters span a newline. {% with %} shortens the slug accessor to keep it under 120.
+CUSTOM_OBJECT_TAGS = """
+{% load helpers %}
+{% with slug=record.custom_object_type.slug %}
+{% for tag in value.all %}
+    <a href="{% url 'plugins:netbox_custom_objects:customobject_list' custom_object_type=slug %}?tag={{ tag.slug }}">
+        <span {% if tag.description %}title="{{ tag.description }}"{% endif %}
+              class="badge"
+              style="color: {{ tag.color|fgcolor }}; background-color: #{{ tag.color }}">
+            {{ tag }}
+        </span>
+    </a>
+{% empty %}
+    <span class="text-muted">&mdash;</span>
+{% endfor %}
+{% endwith %}
+"""
+
+
+class CustomObjectTypeTable(NetBoxTable):
+    comments = columns.MarkdownColumn(
+        verbose_name=_('Comments'),
+    )
+    tags = columns.TagColumn(
+        url_name='plugins:netbox_custom_objects:customobjecttype_list'
+    )
+    name = tables.Column(
+        verbose_name=_('Name'),
+        linkify=True
+    )
+
+    class Meta(NetBoxTable.Meta):
+        model = CustomObjectType
+        fields = (
+            "pk",
+            "id",
+            "name",
+            "verbose_name",
+            "verbose_name_plural",
+            "slug",
+            'description',
+            'comments',
+            'tags',
+            "created",
+            "last_updated",
+        )
+        default_columns = (
+            "pk",
+            "id",
+            "name",
+            "created",
+            "last_updated",
+        )
+
+
+class CustomObjectTagColumn(columns.TagColumn):
+    """
+    Custom TagColumn that generates tag filter URLs with the custom_object_type slug.
+    """
+    template_code = CUSTOM_OBJECT_TAGS
+
+    def __init__(self):
+        # Override parent __init__ to use our custom template
+        tables.TemplateColumn.__init__(
+            self,
+            orderable=False,
+            template_code=self.template_code,
+            verbose_name=_('Tags'),
+        )
+
+
+class CustomObjectActionsColumn(columns.ActionsColumn):
+
+    def render(self, record, table, **kwargs):
+        model = table.Meta.model
+
+        # Skip if no actions or extra buttons are defined
+        if not (self.actions or self.extra_buttons):
+            return ""
+        # Skip dummy records (e.g. available VLANs or IP ranges replacing individual IPs)
+        if type(record) is not model or not getattr(record, "pk", None):
+            return ""
+
+        if request := getattr(table, "context", {}).get("request"):
+            return_url = request.GET.get("return_url", request.get_full_path())
+            url_appendix = f"?return_url={quote(return_url)}"
+        else:
+            url_appendix = ""
+
+        html = ""
+
+        # Compile actions menu
+        button = None
+        dropdown_class = "secondary"
+        dropdown_links = []
+        user = getattr(request, "user", AnonymousUser())
+        for idx, (action, attrs) in enumerate(self.actions.items()):
+            permission = get_permission_for_model(model, attrs.permission)
+            if attrs.permission is None or user.has_perm(permission):
+                url = reverse(
+                    get_viewname(model, action),
+                    kwargs={
+                        "pk": record.pk,
+                        "custom_object_type": record.custom_object_type.slug,
+                    },
+                )
+
+                # Render a separate button if a) only one action exists, or b) if split_actions is True
+                if len(self.actions) == 1 or (self.split_actions and idx == 0):
+                    dropdown_class = attrs.css_class
+                    button = (
+                        f'<a class="btn btn-sm btn-{attrs.css_class}" href="{url}{url_appendix}" type="button" '
+                        f'aria-label="{attrs.title}">'
+                        f'<i class="mdi mdi-{attrs.icon}"></i></a>'
+                    )
+
+                # Add dropdown menu items
+                else:
+                    dropdown_links.append(
+                        f'<li><a class="dropdown-item" href="{url}{url_appendix}">'
+                        f'<i class="mdi mdi-{attrs.icon}"></i> {attrs.title}</a></li>'
+                    )
+
+        # Create the actions dropdown menu
+        toggle_text = _("Toggle Dropdown")
+        if button and dropdown_links:
+            html += (
+                f'<span class="btn-group dropdown">'
+                f"  {button}"
+                f'  <a class="btn btn-sm btn-{dropdown_class} dropdown-toggle" type="button" data-bs-toggle="dropdown" '
+                f'style="padding-left: 2px">'
+                f'  <span class="visually-hidden">{toggle_text}</span></a>'
+                f'  <ul class="dropdown-menu">{"".join(dropdown_links)}</ul>'
+                f"</span>"
+            )
+        elif button:
+            html += button
+        elif dropdown_links:
+            html += (
+                f'<span class="btn-group dropdown">'
+                f'  <a class="btn btn-sm btn-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown">'
+                f'  <span class="visually-hidden">{toggle_text}</span></a>'
+                f'  <ul class="dropdown-menu">{"".join(dropdown_links)}</ul>'
+                f"</span>"
+            )
+
+        # Render any extra buttons from template code
+        if self.extra_buttons:
+            template = Template(self.extra_buttons)
+            context = getattr(table, "context", Context())
+            context.update({"record": record})
+            html = template.render(context) + html
+
+        return mark_safe(html)
+
+
+class CustomObjectTypeFieldTable(NetBoxTable):
+    id = tables.Column()
+    name = tables.Column(
+        verbose_name=_('Name'),
+    )
+    unique = columns.BooleanColumn(
+        verbose_name=_('Unique')
+    )
+    is_cloneable = columns.BooleanColumn(
+        verbose_name=_('Cloneable')
+    )
+    primary = columns.BooleanColumn()
+    required = columns.BooleanColumn()
+
+    exempt_columns = ('actions',)
+
+    class Meta(NetBoxTable.Meta):
+        model = CustomObjectTypeField
+        fields = (
+            "id",
+            "name",
+            "type",
+            "primary",
+            "related_object_type",
+            "label",
+            "group_name",
+            "description",
+            "required",
+            "unique",
+            "search_weight",
+            "filter_logic",
+            "default",
+            "related_object_filter",
+            "weight",
+            "validation_minimum",
+            "validation_maximum",
+            "validation_regex",
+            "choice_set",
+            "ui_visible",
+            "ui_editable",
+            "is_cloneable",
+            "comments",
+            "tags",
+            "created",
+            "last_updated",
+        )
+        default_columns = (
+            "id",
+            "name",
+            "type",
+            "primary",
+            "default",
+            "created",
+            "last_updated",
+        )
+
+
+class CustomObjectTable(NetBoxTable):
+    pk = columns.ToggleColumn(visible=False)
+    id = tables.Column(linkify=True, verbose_name=_("ID"))
+    actions = CustomObjectActionsColumn(
+        actions=('edit', 'delete'),
+    )
+    tags = CustomObjectTagColumn()
+
+    class Meta(NetBoxTable.Meta):
+        model = CustomObject
+        fields = (
+            "pk",
+            "id",
+            "name",
+            "custom_object_type",
+            "created",
+            "last_updated",
+            "tags",
+        )
+        default_columns = (
+            "pk",
+            "id",
+            "name",
+            "custom_object_type",
+            "created",
+            "last_updated",
+        )
