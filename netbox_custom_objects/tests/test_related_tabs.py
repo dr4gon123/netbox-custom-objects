@@ -324,9 +324,12 @@ class TypedViewChildrenTests(TransactionCleanupMixin, CustomObjectsTestCase, Tra
 
         # The full get() flow builds the table via get_table — exercise it
         # directly (a regression here 500s the tab while the page renders).
-        request_superuser = RequestFactory().get('/')
-        request_superuser.user = get_user_model().objects.filter(is_superuser=True).first()
-        table = view.get_table(cot.get_model().objects.all(), request_superuser)
+        builder = get_user_model().objects.create_user(
+            username='table-builder', password='x', is_superuser=True
+        )
+        request_builder = RequestFactory().get('/')
+        request_builder.user = builder
+        table = view.get_table(cot.get_model().objects.all(), request_builder)
         self.assertIn('site', [c.name for c in table.columns])
 
         # A superuser sees the referencing row...
