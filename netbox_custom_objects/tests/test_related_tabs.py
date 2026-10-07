@@ -1,5 +1,5 @@
 """
-Tests for the related_tabs subpackage (combined "Custom Objects" tab).
+Tests for the related_tabs subpackage (per-CustomObjectType tabs).
 
 Focused on the surfaces most likely to regress:
 
@@ -7,46 +7,41 @@ Focused on the surfaces most likely to regress:
   EMPTY Q (which callers must treat as "skip", never as match-all) for an
   unsupported field type or an unresolvable polymorphic through model. A
   regression here would leak every custom object of a type onto every host page.
-* ``_public_host_model_classes()`` enumerates the public models a COT field can
-  target (the tab is registered on all of them) and excludes this plugin's
-  own app (custom-object hosts are served by the generic injected URL).
-* ``register_combined_tabs()`` adds a ``custom_objects`` view to NetBox's view
-  registry for each model, idempotently.
-* ``_count_linked_custom_objects()`` returns None for a model nothing references
-  (the cheap ``.exists()`` fast path that keeps the per-detail-page badge cheap)
-  and a positive count for a referenced one.
+* ``register_builtin_typed_tab()`` adds a ``custom_objects_<slug>`` view to
+  NetBox's view registry for the (host model, type) pair, idempotently — one
+  tab per type, not one shared tab.
+* ``_typed_queryset()`` returns None when the type has no referencing fields
+  for the host's content type, OR-merges multiple referencing fields of the
+  same type (a row referencing the host via either field appears exactly
+  once), and resolves the polymorphic MULTIOBJECT through table.
+* The per-type badge counts only its own type's rows, returns None for an
+  unreferenced host (hide_if_empty), and restricts per user.
+* The ``custom_objects_tab_link`` tag renders one live link per referencing
+  type on custom-object host pages (CO→CO), skipping zero-badge types.
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from core.models import ObjectType
 from django.db.models import Q
-from django.test import TestCase, TransactionTestCase, override_settings
+from django.test import RequestFactory, TestCase, TransactionTestCase
 from extras.choices import CustomFieldTypeChoices
+from netbox.context import current_request
 from netbox.registry import registry
 
 from dcim.models import Site
-from ipam.models import VRF
 
 from netbox_custom_objects.constants import APP_LABEL
-from netbox_custom_objects.related_tabs.registry import (
-    _public_host_model_classes,
-    resolve_tab_label,
-)
-from netbox_custom_objects.related_tabs.views.combined import (
-    COMBINED_LABEL,
-    COMBINED_WEIGHT,
-    _count_linked_custom_objects,
-    _filter_linked_objects,
-    _get_base_template,
-    _get_field_value,
-    _get_linked_custom_objects,
-    _max_multiobject_display,
-    _sort_header,
+from netbox_custom_objects.related_tabs.registry import register_tabs
+from netbox_custom_objects.related_tabs.views.typed import (
+    _make_badge,
+    _make_typed_tab_view,
+    _tab_label,
+    _typed_queryset,
     reference_q,
-    register_combined_tabs,
+    register_builtin_typed_tab,
 )
+from netbox_custom_objects.templatetags.custom_object_tab_tags import custom_objects_tab_link
 from netbox_custom_objects.tests.base import CustomObjectsTestCase, TransactionCleanupMixin
 
 
@@ -87,90 +82,45 @@ class ReferenceQTests(TestCase):
         self.assertFalse(q.children)
 
 
-class GetBaseTemplateTests(TestCase):
+class TabLabelTests(TestCase):
+    """``_tab_label()`` prefers the plural display name and never returns empty."""
+
+    def test_prefers_verbose_name_plural(self):
+        cot = SimpleNamespace(
+            verbose_name_plural='Management Accesses', verbose_name='Management Access', name='management_access'
+        )
+        self.assertEqual(_tab_label(cot), 'Management Accesses')
+
+    def test_falls_back_to_singular_then_name(self):
+        self.assertEqual(
+            _tab_label(SimpleNamespace(verbose_name_plural='', verbose_name='Widget', name='widget')), 'Widget'
+        )
+        self.assertEqual(
+            _tab_label(SimpleNamespace(verbose_name_plural='', verbose_name='', name='widget')), 'widget'
+        )
+
+
+class RegisterTypedTabTests(TestCase):
     """
-    ``_get_base_template()`` must fall back to ``generic/object.html`` for models
-    without an ``{app}/{model}.html`` detail template (e.g. ipam.VRF,
-    dcim.MACAddress) — otherwise the tab template's ``{% extends base_template %}``
-    raises TemplateDoesNotExist (HTTP 500) on those models' tab pages.
+    ``register_builtin_typed_tab()`` adds one ``custom_objects_<slug>`` view per
+    (host model, type) pair to NetBox's process-global view registry, idempotently —
+    a second type referencing the same model gets its OWN tab.
     """
 
-    def test_model_with_detail_template(self):
-        self.assertEqual(_get_base_template(Site()), 'dcim/site.html')
-
-    def test_model_without_detail_template_falls_back_to_generic(self):
-        self.assertEqual(_get_base_template(VRF()), 'generic/object.html')
-
-    def test_custom_object_app_uses_shared_template(self):
-        instance = SimpleNamespace(_meta=SimpleNamespace(app_label=APP_LABEL))
-        self.assertEqual(_get_base_template(instance), 'netbox_custom_objects/customobject.html')
-
-
-class PublicHostModelsTests(TestCase):
-    """
-    ``_public_host_model_classes()`` is the Variant-B registration set: every
-    public model a COT Object/Multi-object field can target, minus this plugin's
-    own app (custom-object hosts are served by the generic injected URL).
-    """
-
-    def test_includes_public_builtin_model(self):
-        labels = {(m._meta.app_label, m._meta.model_name) for m in _public_host_model_classes()}
-        self.assertIn(('dcim', 'site'), labels)
-
-    def test_excludes_custom_objects_app(self):
-        offenders = [m for m in _public_host_model_classes() if m._meta.app_label == APP_LABEL]
-        self.assertEqual(offenders, [], 'CO host models are served by the generic URL and must not be registered')
-
-    def test_deduplicated(self):
-        labels = [(m._meta.app_label, m._meta.model_name) for m in _public_host_model_classes()]
-        self.assertEqual(len(labels), len(set(labels)))
-
-
-class RegisterCombinedTabsTests(TestCase):
-    """
-    ``register_combined_tabs()`` adds one ``custom_objects`` view per model to
-    NetBox's process-global view registry, idempotently.
-    """
+    def setUp(self):
+        self.cot = self._site_cot('reg_cot', 'reg-cot')
 
     def tearDown(self):
         # Don't pollute the process-global registry for other tests.
         entries = registry['views'].get('dcim', {}).get('site', [])
-        registry['views']['dcim']['site'] = [e for e in entries if e['name'] != 'custom_objects']
+        registry['views']['dcim']['site'] = [e for e in entries if not e['name'].startswith('custom_objects_')]
         super().tearDown()
 
     def _site_tab_names(self):
         return [e['name'] for e in registry['views'].get('dcim', {}).get('site', [])]
 
-    def test_registers_tab_view(self):
-        # Don't assert the tab is absent first: register_tabs() at ready() may
-        # already have registered it in this process. Idempotency (verified in
-        # the next test) means register_combined_tabs leaves exactly one entry
-        # either way.
-        register_combined_tabs([Site], COMBINED_LABEL, COMBINED_WEIGHT)
-        self.assertEqual(self._site_tab_names().count('custom_objects'), 1)
-
-    def test_registration_is_idempotent(self):
-        register_combined_tabs([Site], COMBINED_LABEL, COMBINED_WEIGHT)
-        register_combined_tabs([Site], COMBINED_LABEL, COMBINED_WEIGHT)
-        self.assertEqual(self._site_tab_names().count('custom_objects'), 1)
-
-
-class BadgeGateTests(TransactionCleanupMixin, CustomObjectsTestCase, TransactionTestCase):
-    """
-    ``_count_linked_custom_objects`` is both the tab badge and the display gate.
-    It must return None (so hide_if_empty hides the tab, and the cheap .exists()
-    fast path fires) when nothing references the host model, and a live count
-    when something does.
-    """
-
-    def test_unreferenced_model_returns_none(self):
-        # No COT field targets dcim.site -> the .exists() guard short-circuits.
-        site = Site.objects.create(name='Lonely Badge Site', slug='lonely-badge-site')
-        self.assertIsNone(_count_linked_custom_objects(site))
-
-    def test_referenced_model_returns_live_count(self):
-        site = Site.objects.create(name='Badge Site', slug='badge-site')
-        cot = self.create_custom_object_type(name='badge_cot', slug='badge-cot')
+    def _site_cot(self, name, slug):
+        cot = self.create_custom_object_type(name=name, slug=slug)
         self.create_custom_object_type_field(cot, name='name', label='Name', type='text', primary=True)
         self.create_custom_object_type_field(
             cot,
@@ -180,134 +130,33 @@ class BadgeGateTests(TransactionCleanupMixin, CustomObjectsTestCase, Transaction
             is_polymorphic=False,
             related_object_type=ObjectType.objects.get_for_model(Site),
         )
-        model = cot.get_model()
-        model.objects.create(name='co-1', site=site)
+        return cot
 
-        self.assertEqual(_count_linked_custom_objects(site), 1)
-        # A different, unreferenced site still gates to None.
-        other = Site.objects.create(name='Other Site', slug='other-badge-site')
-        self.assertIsNone(_count_linked_custom_objects(other))
+    def test_registers_tab_view(self):
+        register_builtin_typed_tab(Site, self.cot)
+        self.assertIn('custom_objects_reg-cot', self._site_tab_names())
 
+    def test_registration_is_idempotent(self):
+        self.assertTrue(register_builtin_typed_tab(Site, self.cot))
+        self.assertFalse(register_builtin_typed_tab(Site, self.cot))
+        self.assertEqual(self._site_tab_names().count('custom_objects_reg-cot'), 1)
 
-class _Label:
-    """Minimal stand-in with a controllable ``str()`` for the pure-unit tests below."""
-
-    def __init__(self, label):
-        self._label = label
-
-    def __str__(self):
-        return self._label
-
-
-class _FieldLabel(_Label):
-    def __init__(self, label, cot_label):
-        super().__init__(label)
-        self.custom_object_type = _Label(cot_label)
+    def test_second_type_gets_its_own_tab(self):
+        register_builtin_typed_tab(Site, self.cot)
+        other = self._site_cot('reg_cot2', 'reg-cot2')
+        register_builtin_typed_tab(Site, other)
+        names = self._site_tab_names()
+        self.assertIn('custom_objects_reg-cot', names)
+        self.assertIn('custom_objects_reg-cot2', names)
 
 
-class FilterLinkedObjectsTests(TestCase):
-    """``_filter_linked_objects`` is a case-insensitive substring match across the
-    object name, the custom object type, and the field label."""
-
-    def setUp(self):
-        self.linked = [
-            (_Label('Web Server'), _FieldLabel('Hostname', 'Tickets')),
-            (_Label('DB Primary'), _FieldLabel('Owner', 'Assets')),
-        ]
-
-    def test_empty_query_returns_all(self):
-        self.assertEqual(_filter_linked_objects(self.linked, ''), self.linked)
-        self.assertEqual(_filter_linked_objects(self.linked, '   '), self.linked)
-
-    def test_matches_object_name_case_insensitively(self):
-        self.assertEqual(_filter_linked_objects(self.linked, 'WEB'), [self.linked[0]])
-
-    def test_matches_custom_object_type(self):
-        self.assertEqual(_filter_linked_objects(self.linked, 'asset'), [self.linked[1]])
-
-    def test_matches_field_label(self):
-        self.assertEqual(_filter_linked_objects(self.linked, 'hostname'), [self.linked[0]])
-
-    def test_no_match_returns_empty(self):
-        self.assertEqual(_filter_linked_objects(self.linked, 'zzz'), [])
-
-
-class GetFieldValueTests(TestCase):
-    """``_get_field_value`` reads OBJECT / MULTIOBJECT values for the Value column,
-    fetching one extra MULTIOBJECT item so the template can flag truncation without
-    a COUNT query."""
-
-    def test_object_returns_related_instance(self):
-        related = _Label('site-a')
-        field = SimpleNamespace(type=CustomFieldTypeChoices.TYPE_OBJECT, name='site')
-        self.assertIs(_get_field_value(SimpleNamespace(site=related), field), related)
-
-    def test_object_unset_returns_none(self):
-        field = SimpleNamespace(type=CustomFieldTypeChoices.TYPE_OBJECT, name='site')
-        self.assertIsNone(_get_field_value(SimpleNamespace(), field))
-
-    def test_multiobject_truncates_to_max_plus_one(self):
-        limit = _max_multiobject_display()
-        items = [_Label(str(i)) for i in range(limit + 3)]
-        field = SimpleNamespace(type=CustomFieldTypeChoices.TYPE_MULTIOBJECT, name='targets')
-        obj = SimpleNamespace(targets=SimpleNamespace(all=lambda: items))
-        self.assertEqual(_get_field_value(obj, field), items[: limit + 1])
-
-    def test_multiobject_under_limit_returns_all(self):
-        items = [_Label('a'), _Label('b')]
-        field = SimpleNamespace(type=CustomFieldTypeChoices.TYPE_MULTIOBJECT, name='targets')
-        obj = SimpleNamespace(targets=SimpleNamespace(all=lambda: items))
-        self.assertEqual(_get_field_value(obj, field), items)
-
-    def test_multiobject_respects_configured_limit(self):
-        """The Value column honours the max_multiobject_display plugin setting."""
-        items = [_Label(str(i)) for i in range(10)]
-        field = SimpleNamespace(type=CustomFieldTypeChoices.TYPE_MULTIOBJECT, name='targets')
-        obj = SimpleNamespace(targets=SimpleNamespace(all=lambda: items))
-        with patch(
-            'netbox_custom_objects.related_tabs.views.combined.get_plugin_config',
-            return_value=1,
-        ):
-            # configured limit 1, plus the 1 extra item used for truncation detection
-            self.assertEqual(_get_field_value(obj, field), items[:2])
-
-    def test_multiobject_unset_returns_empty_list(self):
-        field = SimpleNamespace(type=CustomFieldTypeChoices.TYPE_MULTIOBJECT, name='targets')
-        self.assertEqual(_get_field_value(SimpleNamespace(), field), [])
-
-
-class SortHeaderTests(TestCase):
-    """``_sort_header`` builds native-style sortable headers off a single ``?sort=``
-    param (a ``-`` prefix means descending)."""
-
-    def test_inactive_column(self):
-        h = _sort_header('object', {}, 'type', False)
-        self.assertFalse(h['is_active'])
-        self.assertEqual(h['th_class'], '')
-        self.assertEqual(h['url'], '?sort=object')
-        self.assertEqual(h['clear_url'], '?')
-
-    def test_active_ascending_toggles_to_descending(self):
-        h = _sort_header('type', {}, 'type', False)
-        self.assertTrue(h['is_active'])
-        self.assertEqual(h['th_class'], 'asc')
-        self.assertEqual(h['url'], '?sort=-type')
-
-    def test_active_descending_toggles_to_ascending(self):
-        h = _sort_header('type', {}, 'type', True)
-        self.assertTrue(h['is_active'])
-        self.assertEqual(h['th_class'], 'desc')
-        self.assertEqual(h['url'], '?sort=type')
-
-    def test_base_params_preserved_in_links(self):
-        h = _sort_header('object', {'q': 'x'}, 'type', False)
-        self.assertEqual(h['url'], '?q=x&sort=object')
-        self.assertEqual(h['clear_url'], '?q=x')
-
-
-class CombinedTabQueryTests(TransactionCleanupMixin, CustomObjectsTestCase, TransactionTestCase):
-    """DB-backed coverage for reference resolution, per-row permission enforcement,
-    and badge summation — the parts of the tab a mocked unit test can't reach."""
+class TypedQuerysetTests(TransactionCleanupMixin, CustomObjectsTestCase, TransactionTestCase):
+    """
+    ``_typed_queryset()`` is the SQL filter behind the tab's rows and badge:
+    None when the type has no referencing fields for the host's content type,
+    OR-merged across multiple referencing fields, and correct through the
+    polymorphic MULTIOBJECT through table.
+    """
 
     def _object_field_cot(self, name, slug):
         cot = self.create_custom_object_type(name=name, slug=slug)
@@ -322,7 +171,43 @@ class CombinedTabQueryTests(TransactionCleanupMixin, CustomObjectsTestCase, Tran
         )
         return cot
 
-    def test_polymorphic_multiobject_through_is_resolved_and_counted(self):
+    def test_no_referencing_fields_returns_none(self):
+        site = Site.objects.create(name='No Fields Site', slug='no-fields-site')
+        cot = self.create_custom_object_type(name='empty_cot', slug='empty-cot')
+        self.assertIsNone(_typed_queryset(cot, site))
+
+    def test_row_referencing_via_either_field_is_matched_once(self):
+        # Two fields of the SAME type pointing at Site (one OBJECT, one
+        # MULTIOBJECT): a row matching via either — or both — appears exactly
+        # once (the OR is a single SQL WHERE, not a union).
+        site = Site.objects.create(name='OR Site', slug='or-site')
+        cot = self.create_custom_object_type(name='or_cot', slug='or-cot')
+        self.create_custom_object_type_field(cot, name='name', label='Name', type='text', primary=True)
+        self.create_custom_object_type_field(
+            cot, name='site', label='Site',
+            type=CustomFieldTypeChoices.TYPE_OBJECT, is_polymorphic=False,
+            related_object_type=ObjectType.objects.get_for_model(Site),
+        )
+        self.create_custom_object_type_field(
+            cot, name='sites', label='Sites',
+            type=CustomFieldTypeChoices.TYPE_MULTIOBJECT, is_polymorphic=False,
+            related_object_type=ObjectType.objects.get_for_model(Site),
+        )
+        model = cot.get_model()
+        row = model.objects.create(name='via-object', site=site)
+        row.sites.set([site])
+        model.objects.create(name='unrelated')  # references neither field
+
+        qs = _typed_queryset(cot, site)
+        self.assertEqual(qs.count(), 1)
+        self.assertEqual(qs.get().name, 'via-object')
+
+        # A different site matches nothing (guards against a match-all filter).
+        other = Site.objects.create(name='OR Other', slug='or-other')
+        qs_other = _typed_queryset(cot, other)
+        self.assertTrue(qs_other is None or qs_other.count() == 0)
+
+    def test_polymorphic_multiobject_through_is_resolved(self):
         # Exercises reference_q()'s polymorphic-MULTIOBJECT subquery branch end to
         # end: a wrong through filter key would silently drop the row (count 0).
         from django.apps import apps as django_apps
@@ -347,117 +232,159 @@ class CombinedTabQueryTests(TransactionCleanupMixin, CustomObjectsTestCase, Tran
             object_id=site.pk,
         )
 
-        self.assertEqual(_count_linked_custom_objects(site), 1)
-        # An unrelated site is not matched (guards against a match-all subquery).
+        self.assertEqual(_typed_queryset(cot, site).count(), 1)
         other = Site.objects.create(name='Poly MO Other', slug='poly-mo-other')
-        self.assertIsNone(_count_linked_custom_objects(other))
+        self.assertIsNone(_typed_queryset(cot, other))
+
+
+class BadgeTests(TransactionCleanupMixin, CustomObjectsTestCase, TransactionTestCase):
+    """
+    The per-type badge is both the tab badge and the display gate. It must
+    count only its OWN type's rows, return None for an unreferenced host
+    (hide_if_empty), and restrict per user.
+    """
+
+    def _object_field_cot(self, name, slug):
+        cot = self.create_custom_object_type(name=name, slug=slug)
+        self.create_custom_object_type_field(cot, name='name', label='Name', type='text', primary=True)
+        self.create_custom_object_type_field(
+            cot,
+            name='site',
+            label='Site',
+            type=CustomFieldTypeChoices.TYPE_OBJECT,
+            is_polymorphic=False,
+            related_object_type=ObjectType.objects.get_for_model(Site),
+        )
+        return cot
+
+    def test_counts_only_its_own_type(self):
+        site = Site.objects.create(name='Per Type Site', slug='per-type-site')
+        cot_a = self._object_field_cot('badge_a', 'badge-a')
+        cot_b = self._object_field_cot('badge_b', 'badge-b')
+        cot_a.get_model().objects.create(name='a-1', site=site)
+        cot_b.get_model().objects.create(name='b-1', site=site)
+
+        self.assertEqual(_make_badge(cot_a)(site), 1)
+        self.assertEqual(_make_badge(cot_b)(site), 1)
+
+        # A different, unreferenced site gates to None.
+        other = Site.objects.create(name='Per Type Other', slug='per-type-other')
+        self.assertIsNone(_make_badge(cot_a)(other))
 
     def test_rows_and_badge_are_restricted_per_user(self):
         from django.contrib.auth import get_user_model
-        from django.test import RequestFactory
-        from netbox.context import current_request
 
         site = Site.objects.create(name='Perm Site', slug='perm-site')
-        self._object_field_cot('perm_cot', 'perm-cot').get_model().objects.create(name='co-1', site=site)
-        limited = get_user_model().objects.create_user(username='limited-rows', password='x')
+        cot = self._object_field_cot('perm_cot', 'perm-cot')
+        cot.get_model().objects.create(name='co-1', site=site)
+        limited = get_user_model().objects.create_user(username='limited-rows-2', password='x')
 
-        # Rows: a non-superuser with no object permissions sees none.
-        self.assertEqual(_get_linked_custom_objects(site, user=limited), [])
+        badge = _make_badge(cot)
 
-        # Badge: with no request context it falls back to an unrestricted count...
-        self.assertEqual(_count_linked_custom_objects(site), 1)
+        # With no request context the badge falls back to an unrestricted count...
+        self.assertEqual(badge(site), 1)
 
-        # ...and with the limited user on the request, the badge restricts to the
+        # ...and with the limited user on the request, it restricts to the
         # same (empty) result, returning None so hide_if_empty hides the tab.
         req = RequestFactory().get('/')
         req.user = limited
         token = current_request.set(req)
         try:
-            self.assertIsNone(_count_linked_custom_objects(site))
+            self.assertIsNone(badge(site))
         finally:
             current_request.reset(token)
 
-    def test_badge_sums_across_multiple_cots(self):
-        site = Site.objects.create(name='Multi COT Site', slug='multi-cot-site')
-        self._object_field_cot('badge_multi_1', 'badge-multi-1').get_model().objects.create(name='a', site=site)
-        self._object_field_cot('badge_multi_2', 'badge-multi-2').get_model().objects.create(name='b', site=site)
-        self.assertEqual(_count_linked_custom_objects(site), 2)
 
-    def test_batch_multiobject_values_are_correct_and_dont_scale_per_row(self):
-        # Locks in the Value-column batching fix: resolving a non-polymorphic
-        # MULTIOBJECT column must cost a constant number of queries (one prefetch
-        # per (model, field) group), not one query per row.
-        from django.db import connection
-        from django.test.utils import CaptureQueriesContext
+class TypedViewChildrenTests(TransactionCleanupMixin, CustomObjectsTestCase, TransactionTestCase):
+    """The registered tab view's get_children() returns the type's rows for the
+    host, restricted per user."""
 
-        from netbox_custom_objects.related_tabs.views.combined import _batch_multiobject_values
+    def test_get_children_returns_rows_and_restricts(self):
+        from django.contrib.auth import get_user_model
 
-        target_a = Site.objects.create(name='MO Target A', slug='mo-target-a')
-        target_b = Site.objects.create(name='MO Target B', slug='mo-target-b')
-
-        cot = self.create_custom_object_type(name='mo_batch', slug='mo-batch')
+        site = Site.objects.create(name='Children Site', slug='children-site')
+        cot = self.create_custom_object_type(name='children_cot', slug='children-cot')
         self.create_custom_object_type_field(cot, name='name', label='Name', type='text', primary=True)
-        field = self.create_custom_object_type_field(
+        self.create_custom_object_type_field(
             cot,
-            name='sites',
-            label='Sites',
-            type=CustomFieldTypeChoices.TYPE_MULTIOBJECT,
+            name='site',
+            label='Site',
+            type=CustomFieldTypeChoices.TYPE_OBJECT,
             is_polymorphic=False,
             related_object_type=ObjectType.objects.get_for_model(Site),
         )
-        model = cot.get_model()
-        for i in range(6):
-            obj = model.objects.create(name=f'mo-row-{i}')
-            obj.sites.set([target_a, target_b])
+        cot.get_model().objects.create(name='co-1', site=site)
 
-        # The same field object is shared across a model's rows (mirrors
-        # _iter_linked_fields), so id(field) keys the whole group. Build both pair
-        # lists up front (fresh instances => no prefetch-cache carryover) so only
-        # the _batch_multiobject_values work — not the row fetch — is measured.
-        def fresh_pairs(n):
-            return [(obj, field) for obj in model.objects.order_by('pk')[:n]]
+        view_cls = _make_typed_tab_view(Site, cot)
+        view = view_cls()
+        request = RequestFactory().get('/')
+        request.user = get_user_model().objects.create_user(username='children-viewer', password='x')
 
-        small_pairs = fresh_pairs(2)
-        large_pairs = fresh_pairs(6)
+        self.assertEqual(view.get_children(request, site).count(), 1)
 
-        with CaptureQueriesContext(connection) as few:
-            _batch_multiobject_values(small_pairs, user=None)
-        with CaptureQueriesContext(connection) as many:
-            resolved = _batch_multiobject_values(large_pairs, user=None)
 
-        self.assertEqual(
-            len(few.captured_queries),
-            len(many.captured_queries),
-            'multiobject Value resolution must not issue a query per row',
+class CoTabLinkTests(TransactionCleanupMixin, CustomObjectsTestCase, TransactionTestCase):
+    """
+    The ``custom_objects_tab_link`` tag renders one live link per referencing
+    type on custom-object host pages (CO→CO), skipping zero-badge types —
+    the CO→CO half of the no-restart guarantee.
+    """
+
+    def test_one_link_per_referencing_type(self):
+        from django.contrib.auth import get_user_model
+
+        # Host type A; target type B has an OBJECT field pointing at A.
+        host_cot = self.create_custom_object_type(name='link_host', slug='link-host')
+        self.create_custom_object_type_field(host_cot, name='name', label='Name', type='text', primary=True)
+        target_cot = self.create_custom_object_type(name='link_target', slug='link-target')
+        self.create_custom_object_type_field(target_cot, name='name', label='Name', type='text', primary=True)
+        self.create_custom_object_type_field(
+            target_cot,
+            name='host',
+            label='Host',
+            type=CustomFieldTypeChoices.TYPE_OBJECT,
+            is_polymorphic=False,
+            related_object_type=host_cot.object_type,
         )
 
-        # ...and the batched values are still correct.
-        for obj, _field in large_pairs:
-            self.assertEqual(
-                {s.pk for s in resolved[(id(obj), id(field))]},
-                {target_a.pk, target_b.pk},
-            )
+        host_row = host_cot.get_model().objects.create(name='host-1')
+        target_cot.get_model().objects.create(name='target-1', host=host_row)
+
+        admin = get_user_model().objects.filter(is_superuser=True).first()
+        request = RequestFactory().get('/')
+        request.user = admin
+
+        result = custom_objects_tab_link({'request': request}, host_row)
+        self.assertEqual(len(result['tabs']), 1)
+        tab = result['tabs'][0]
+        self.assertEqual(tab['badge'], 1)
+        self.assertEqual(tab['label'], _tab_label(target_cot))
+        self.assertFalse(tab['is_active'])
+
+        # A host row nothing references renders no links (hide_if_empty).
+        host_row2 = host_cot.get_model().objects.create(name='host-2')
+        self.assertEqual(custom_objects_tab_link({'request': request}, host_row2)['tabs'], [])
 
 
-class ResolveTabLabelTest(TestCase):
+class RegisterTabsSmokeTests(TestCase):
     """
-    resolve_tab_label() maps the ``tab_label`` plugin setting to the combined
-    tab's label, falling back to the built-in COMBINED_LABEL when unset, blank,
-    or not a string.
+    register_tabs() runs over live DB state without raising (ready() already
+    called it during setup; calling it again must be safe).
     """
 
-    def test_falls_back_when_unset(self):
-        with override_settings(PLUGINS_CONFIG={APP_LABEL: {}}):
-            self.assertEqual(resolve_tab_label(), COMBINED_LABEL)
+    def test_register_tabs_does_not_raise(self):
+        names_before = self._typed_tab_names()
+        register_tabs()
+        # Idempotent: a second pass adds no new tabs beyond what the first
+        # (ready()) pass registered for the same DB state.
+        self.assertEqual(self._typed_tab_names(), names_before)
 
-    def test_uses_configured_label(self):
-        with override_settings(PLUGINS_CONFIG={APP_LABEL: {'tab_label': 'Attachments'}}):
-            self.assertEqual(resolve_tab_label(), 'Attachments')
-
-    def test_blank_falls_back(self):
-        with override_settings(PLUGINS_CONFIG={APP_LABEL: {'tab_label': '   '}}):
-            self.assertEqual(resolve_tab_label(), COMBINED_LABEL)
-
-    def test_non_string_falls_back(self):
-        with override_settings(PLUGINS_CONFIG={APP_LABEL: {'tab_label': 42}}):
-            self.assertEqual(resolve_tab_label(), COMBINED_LABEL)
+    @staticmethod
+    def _typed_tab_names():
+        return [
+            entry['name']
+            for app_entries in registry['views'].values()
+            for model_entries in app_entries.values()
+            for entry in model_entries
+            if entry['name'].startswith('custom_objects_')
+        ]

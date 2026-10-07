@@ -295,7 +295,7 @@ class CustomObjectsPluginConfig(PluginConfig):
     name = "netbox_custom_objects"
     verbose_name = "Custom Objects"
     description = "A plugin to manage custom objects in NetBox"
-    version = "0.7.0+supra.tablabel"
+    version = "0.7.0+supra.perTypeTabs"
     author = 'Netbox Labs'
     author_email = 'support@netboxlabs.com'
     base_url = "custom-objects"
@@ -305,17 +305,11 @@ class CustomObjectsPluginConfig(PluginConfig):
     default_settings = {
         # The maximum number of Custom Object Types that may be created
         'max_custom_object_types': 50,
-        # Max related objects shown per row in the combined tab's Value column
-        # for a multi-object field before the rest are truncated to an ellipsis.
-        'max_multiobject_display': 3,
-        # Label of the combined related-objects tab rendered on model detail
-        # pages. Falls back to "Custom Objects" when unset or blank.
-        'tab_label': 'Custom Objects',
     }
     required_settings = []
 
     # Set by ready() to a short "ExcType: message" string if registering the
-    # combined "Custom Objects" related tab fails; None means no failure.
+    # per-type related-object tabs fails; None means no failure.
     # Surfaced as a system check warning (checks.check_related_tabs_registration)
     # so the swallowed exception isn't invisible outside the logs.
     _register_tabs_error = None
@@ -584,8 +578,9 @@ class CustomObjectsPluginConfig(PluginConfig):
         # first would break reverse() for CustomObject feature URLs.
         self._call_super_ready_once()
 
-        # Register the combined "Custom Objects" tab (see related_tabs/__init__.py),
-        # once at startup before Django freezes the root URLconf.
+        # Register the per-type related-object tabs (see
+        # related_tabs/__init__.py), once at startup before Django freezes the
+        # root URLconf.
         try:
             from netbox_custom_objects.related_tabs.registry import register_tabs
             register_tabs()

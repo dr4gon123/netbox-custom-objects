@@ -1,4 +1,6 @@
 from django import template
+from django.contrib.contenttypes.models import ContentType
+from django.db.models import Q
 from django.urls.exceptions import NoReverseMatch
 from django.utils.module_loading import import_string
 from netbox.registry import registry
@@ -23,7 +25,7 @@ def plugin_extra_tabs(context, instance):
     """
     Render registered model-view tabs for `instance`, excluding tabs that the
     Custom Object detail template already renders by hand (Journal, Changelog,
-    and the combined Custom Objects tab — see _HARDCODED_TAB_NAMES).
+    and the per-type Custom Objects tabs — see _HARDCODED_TAB_NAMES).
     """
     app_label = instance._meta.app_label
     model_name = instance._meta.model_name
@@ -62,42 +64,67 @@ def plugin_extra_tabs(context, instance):
     return {'tabs': tabs}
 
 
-@register.inclusion_tag('netbox_custom_objects/related_tabs/combined/tab_link.html', takes_context=True)
+@register.inclusion_tag('netbox_custom_objects/related_tabs/typed/tab_links.html', takes_context=True)
 def custom_objects_tab_link(context, instance):
     """
-    Render the combined "Custom Objects" tab nav-link on a custom object detail
-    page, computed live from the DB (not the startup view registry).
+    Render the per-type "Custom Objects" tab nav-links on a custom object
+    detail page — one link per referencing CustomObjectType — computed live
+    from the DB (not the startup view registry).
 
     This is what makes references *between* custom object types live without a
-    NetBox restart: the tab's URL is a single COT-agnostic route injected at
-    startup (``registry._inject_co_urls``) that reverses for any slug, and the
-    nav-link's visibility/badge are recomputed per render here.  Returns an empty
-    context (no link) when the badge count is zero (hide_if_empty) or the URL
+    NetBox restart: the tabs' URLs reverse a single slug-agnostic route
+    injected at startup (``registry._inject_co_urls``), and each nav-link's
+    visibility/badge are recomputed per render here.  A type with a zero badge
+    renders no link (hide_if_empty), and nothing renders at all when the URL
     can't be reversed (plugin URLs not loaded).
     """
-    from netbox_custom_objects.related_tabs.views.combined import COMBINED_LABEL, _count_linked_custom_objects
+    from extras.choices import CustomFieldTypeChoices
+    from netbox_custom_objects.models import CustomObjectTypeField
+    from netbox_custom_objects.related_tabs.views.typed import _tab_label, _typed_queryset
 
-    badge = _count_linked_custom_objects(instance)
-    if not badge:
-        return {'tab': None}
+    host_ct = ContentType.objects.get_for_model(instance._meta.model)
+    type_choices = (CustomFieldTypeChoices.TYPE_OBJECT, CustomFieldTypeChoices.TYPE_MULTIOBJECT)
+    field_list = CustomObjectTypeField.objects.filter(
+        (Q(related_object_type=host_ct) & Q(is_polymorphic=False))
+        | (Q(related_object_types=host_ct) & Q(is_polymorphic=True)),
+        type__in=type_choices,
+    ).select_related('custom_object_type')
 
-    try:
-        url = get_action_url(instance, action='custom_objects', kwargs={'pk': instance.pk})
-    except NoReverseMatch:
-        return {'tab': None}
-
-    # Active iff we are actually on the combined-tab page.  Compare the request
-    # path to the tab URL rather than inspecting context['tab']: other plugins may
-    # also register ViewTab-bearing views on custom-object models, so a type-based
-    # check would light this link up on those tabs too.
     request = context.get('request')
-    is_active = request is not None and request.path == url
+    user = getattr(request, 'user', None)
 
-    return {
-        'tab': {
-            'url': url,
-            'label': COMBINED_LABEL,
-            'badge': badge,
-            'is_active': is_active,
-        }
-    }
+    tabs = []
+    seen = set()
+    for field in field_list:
+        target = field.custom_object_type
+        if target.pk in seen:
+            continue
+        seen.add(target.pk)
+
+        qs = _typed_queryset(target, instance, user)
+        badge = qs.count() if qs is not None else 0
+        if not badge:
+            continue
+
+        try:
+            url = get_action_url(
+                instance, action='custom_objects', kwargs={'pk': instance.pk, 'target_slug': target.slug}
+            )
+        except NoReverseMatch:
+            continue
+
+        # Active iff we are actually on that tab's page.  Compare the request
+        # path to the tab URL rather than inspecting context['tab']: other
+        # plugins may also register ViewTab-bearing views on custom-object
+        # models, so a type-based check would light links up on those tabs too.
+        tabs.append(
+            {
+                'url': url,
+                'label': _tab_label(target),
+                'badge': badge,
+                'is_active': request is not None and request.path == url,
+            }
+        )
+
+    tabs.sort(key=lambda t: str(t['label']).lower())
+    return {'tabs': tabs}
